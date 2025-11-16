@@ -1,0 +1,469 @@
+---
+title: "Disease subtype discovery on multi-omics data for Prostate adenocarcinoma"
+author: "Marco Barbaro & Valeria Stighezza"
+date: "1 November 2024"
+csl: ieee.csl
+output:
+  html_notebook:
+    toc: yes
+    number_sections: yes
+    toc_float: yes
+    theme: cerulean
+    fig_caption: yes
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+The project regards the discovery of disease subtypes using a
+multi-omics dataset coming from TCGA. The dataset is the Prostate
+adenocarcinoma dataset (disease code “PRAD”). We will consider as
+disease subtypes the ones identified in a work performed by The Cancer
+Genome Atlas Research Network [1], where they used an integrative
+clustering model (called iCluster [2]) on multi-omics data (somatic
+copy-number alterations, methylation, mRNA, microRNA, and protein
+levels) and discovered three disease subtypes.
+
+1.  Download the Prostate adenocarcinoma dataset considering three
+    different omics data sources (mRNA, miRNA and protein expression
+    data). The TCGA code for the dataset is “PRAD”.
+
+```{r}
+
+install.packages("httr2"); #needed for TCGAbiolinks
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("curatedTCGAData");
+BiocManager::install("TCGAbiolinks");
+BiocManager::install("TCGAutils");
+BiocManager::install("graph"); #needed for NetPreProc
+
+install.packages("SNFtool");
+install.packages("NetPreProc");
+install.packages("caret");
+install.packages("cluster");
+install.packages("mclustcomp");
+install.packages("mcclust");
+install.packages("yardstick");
+install.packages("dplyr");
+install.packages("funtimes");
+install.packages("clevr");
+
+install.packages("reshape2");
+install.packages("ggplot2");
+install.packages("gt"); #to build rendered tables
+install.packages("pagedown"); #to export tables in pdf
+
+install.packages("devtools")
+```
+
+```{r message=FALSE, warning=FALSE}
+library("curatedTCGAData")
+library("TCGAbiolinks");
+library("TCGAutils");
+library("NetPreProc");
+library("caret");
+library("cluster"); #pam
+library("SNFtool");
+library("mclustcomp");
+library("mcclust");
+library("NEMO");
+library("yardstick");
+library("dplyr");
+library("funtimes");
+library("clevr");
+library("reshape2"); #graph
+library("ggplot2"); #graph
+library("gt");
+library("pagedown");
+```
+
+```{r}
+#assay refers to a specific type of experimental measurement or analysis
+#performed on a biological sample to capture data at a particular molecular #level. Each assay represents a distinct omics layer, such as:
+#Genomics Assay, Transcriptomics Assay, Proteomics Assay, Metabolomics Assay
+
+assays <- c("RNASeq2Gene", "miRNASeqGene", "RPPAArray");
+multi_omics_dataset <- curatedTCGAData(diseaseCode = "PRAD", 
+                        assays = assays, 
+                        version = "2.0.1", dry.run = FALSE);
+multi_omics_dataset
+```
+
+2.  Pre-process the dataset following the same steps we used during
+    lessons. During the filtering by variance, select the first 100
+    features having highest variance from each data source.
+
+```{r message=FALSE, warning=FALSE}
+# Consider only primary solid tumors:
+primary <- TCGAutils::TCGAsampleSelect(colnames(multi_omics_dataset), c("01"));
+multi_omics_dataset <- multi_omics_dataset[, primary, ];
+
+# Check for replicates (anyReplicated checks the so called biological or 
+# primary unit in the sampleMap of the MultiAssayExperiment object, that
+# corresponds to the first 12 characters of the barcodes for TCGA data):
+check_rep <- anyReplicated(multi_omics_dataset);
+print(check_rep);
+
+# The information regarding if the sample is FFPE is stored in the clinical data,
+# which are accessible using colData(). 
+no_ffpe <- which(as.data.frame(colData(multi_omics_dataset))$patient.samples.sample.is_ffpe == "no");
+multi_omics_dataset <- multi_omics_dataset[, no_ffpe, ];
+
+# Obtain samples having all the considered omics:
+complete <- intersectColumns(multi_omics_dataset);
+
+# Extract assays in list:
+complete <- assays(complete);
+
+# Obtain matrices samples x features:
+# Transposes the matrix
+complete <- lapply(complete, FUN=t)
+
+# Remove features having NAs (present only in proteomics data):
+complete[[3]] <- complete[[3]][, colSums(is.na(complete[[3]])) == 0];
+
+# Remove features with near zero variance and retain top 100 features 
+# having higher variance:
+features_threshold <- 100;
+for(i in 1:length(complete)){
+    zero_var_indexes <- caret::nearZeroVar(complete[[i]])
+    message(paste("Removed ", length(zero_var_indexes), "features from", names(complete)[i]));
+    
+    if(length(zero_var_indexes) != 0){
+        complete[[i]] <- complete[[i]][, -zero_var_indexes];
+    }
+
+    # if less features than threashold return them all
+    if(ncol(complete[[i]]) <= features_threshold) next
+    
+    vars <- apply(complete[[i]], 2, var);
+    var_ordered_indexes <- sort(vars, index.return=TRUE, decreasing = TRUE)$ix;
+    
+    complete[[i]] <- complete[[i]][, var_ordered_indexes[1:features_threshold]];
+}
+
+# Perform features standardization using z-score:
+zscore <- function(data){
+    zscore_vec <- function(x) { return ((x - mean(x)) / sd(x))}
+    data <- apply(data, 2, zscore_vec)
+    data
+}
+
+complete <- lapply(complete, zscore);
+
+# Clean barcodes retaining only "Project-TSS-Participant":
+for(v in 1:length(complete)){
+    rownames(complete[[v]]) <- substr(rownames(complete[[v]]), 1, 12);
+}
+```
+
+3.  Download the disease subtypes (column “Subtype_Integrative” is the
+    one containing the iCluster molecular subtypes). Note that not all
+    subtypes are available for the set of samples having all the
+    considered omics data sources, thus you need to retain from the
+    multi-omics dataset only samples having an associated subtype.
+
+```{r}
+# Download disease subtypes from TCGAbiolinks:
+subtypes <- as.data.frame(TCGAbiolinks::PanCancerAtlas_subtypes());
+subtypes <- subtypes[subtypes$cancer.type == "PRAD", ];
+
+# Retain only primary solid tumors and select samples form multi-omics dataset having an associated subtype
+# (in the same order):
+subtypes <- subtypes[TCGAutils::TCGAsampleSelect(subtypes$pan.samplesID, "01"), ];
+samples_with_subtype <- rownames(complete[[1]]) %in% substr(subtypes$pan.samplesID, 1, 12);
+subtypes_with_sample <- substr(subtypes$pan.samplesID, 1, 12) %in% rownames(complete[[1]])
+
+subtypes <- subtypes[subtypes_with_sample,]
+rownames(subtypes) <- substr(subtypes$pan.samplesID, 1, 12);
+
+for(v in 1:length(complete)) {
+  complete[[v]] <- complete[[v]][samples_with_subtype,];
+}
+```
+
+4.  Check that patients in multi-omics dataset and subtypes are in the
+    same order.
+
+```{r}
+subtypes <- subtypes[order(subtypes$pan.samplesID), ]
+for(v in 1:length(complete)) {
+  complete[[v]] <- complete[[v]][order(rownames(complete[[v]])),];  
+}
+all(rownames(subtypes) == rownames(complete[[1]]))
+```
+
+5.  Integrate the data using Similarity Network Fusion [3] with the
+    scaled exponential euclidean distance.
+
+```{r}
+# Compute similarity matrix for each data source using the scaled
+# exponential euclidean distance:
+W_omics <- list();
+for(i in 1:length(complete))
+{
+    distances_matrix <- (SNFtool::dist2(as.matrix(complete[[i]]), as.matrix(complete[[i]])))^(1/2);
+    W_omics[[i]] <- SNFtool::affinityMatrix(distances_matrix);
+}
+    
+# Integration of multi-omics data using Similarity Network Fusion:
+# t is the number of iterations and K is the number of neighbors to 
+# consider to compute the local similarity matrix:
+W_SNF <- SNFtool::SNF(W_omics, K=20, t=20);
+```
+
+6.  Try to integrate the similarity matrices from each data source
+    (computed by scaled exponential euclidean distance) using a simple
+    average of the matrices. This can be considered as a trivial
+    multi-omics data integration strategy.
+
+```{r}
+W_AVG <- Reduce(`+`, W_omics) / length(W_omics)
+```
+
+7.  [GROUP] Integrate the dataset using another data fusion method
+    called NEMO [4] to obtain an integrated similarity matrix. NEMO
+    implementation is available on github
+    (<https://github.com/ShamirLab/NEMO>).
+
+```{r}
+#we use the transpose (dataset as features x samples) to compute the similarity matrix with NEMO
+transposed <- lapply(complete, FUN=base::t)
+W_NEMO = NEMO::nemo.affinity.graph(raw.data = transposed, k = 20)
+```
+
+8.  Perform disease subtype discovery (number of clusters equal to the
+    number of disease subtypes found by iCluster) using PAM algorithm
+    [5] on the following similarity matrices:
+
+<!-- -->
+
+a.  Similarity matrices obtained from single data sources (i.e. miRNA,
+    mRNA, proteins) using the usual scaled exponential euclidean
+    distance. Thus, you should obtain three different similarity
+    matrices. To compute the corresponding distance matrix use this
+    code: dist \<- 1 - NetPreProc::Max.Min.norm(W). Max.Min.norm()
+    function is in the NetPreProc CRAN package
+    (<https://cran.r-project.org/web/packages/NetPreProc/index.html>).
+    The idea is to normalize the similarity matrix before computing the
+    corresponding distance.
+b.  Integrated matrix obtained using the average among matrices. Use
+    dist \<- 1 - NetPreProc::Max.Min.norm(W) to compute the distance
+    matrix.
+c.  Integrated matrix obtained using Similarity Network Fusion. Use dist
+    \<- 1 - NetPreProc::Max.Min.norm(W) to compute the distance matrix.
+d.  [GROUP] Integrated matrix obtained using NEMO. Use dist \<- 1 -
+    NetPreProc::Max.Min.norm(W) to compute the distance matrix.
+
+```{r}
+clustering_names <- list();
+
+#Get the number of clusters for PAM equal to the number of unique subtypes
+n_of_clusters <- length(unique(subtypes$Subtype_Selected))
+
+PAM.compute <- function(similarity_matrix, k) {
+  #We obtain the normalized distance matrix form the similarity matrix of the i-th assay
+  distances <- as.dist(1 - NetPreProc::Max.Min.norm(similarity_matrix))
+  #We compute and return the PAM Clustering for the i-th assay
+  pam(distances, k=n_of_clusters)
+}
+
+# PAM clustering for each assay
+pam_results <- list();
+pam_next_count <- 1;
+for(i in 1:length(W_omics)) {
+  pam_results[[pam_next_count]] <- PAM.compute(W_omics[[i]], n_of_clusters)
+  pam_next_count <- pam_next_count + 1;
+}
+clustering_names[1:length(W_omics)] <- c("PAM miRNA data", "PAM mRNA data", "PAM Protein expression data")
+
+# PAM clustering for average matrix of the assays
+pam_results[[pam_next_count]] <- PAM.compute(W_AVG, n_of_clusters)
+clustering_names[[pam_next_count]] <- "PAM AVG integration"
+pam_next_count <- pam_next_count + 1;
+
+# PAM clustering of the SNF integration matrix
+pam_results[[pam_next_count]] <- PAM.compute(W_SNF, n_of_clusters)
+clustering_names[[pam_next_count]] <- "PAM SNF integration"
+pam_next_count <- pam_next_count + 1;
+
+# PAM clustering of the NEMO affinity matrix
+pam_results[[pam_next_count]] <- PAM.compute(W_NEMO, n_of_clusters)
+clustering_names[[pam_next_count]] <- "PAM NEMO integration"
+pam_next_count <- pam_next_count + 1
+```
+
+9.  [GROUP] NEMO provides the possibility of performing clustering using
+    another approach called Spectral Clustering [6]. Use the function
+    nemo.clustering() to test this approach.
+
+```{r}
+NEMO_spectral_clustering = spectralClustering(W_NEMO, n_of_clusters)
+clustering_names[[pam_next_count]] <- "Spectral NEMO integration"
+pam_next_count <- pam_next_count + 1
+```
+
+10. [OPTIONAL] Apply Spectral Clustering on the integrated matrix
+    obtained using Similarity Network Fusion (an implementation of
+    spectral clustering is SNFtool::spectralClustering(), which is the
+    same exploited in nemo.clustering()).
+
+```{r}
+SNF_spectral_clustering <- SNFtool::spectralClustering(W_SNF, K=n_of_clusters)
+clustering_names[[pam_next_count]] <- "Spectral SNF integration"
+pam_next_count <- pam_next_count + 1
+```
+
+11. Compare the clusterings obtained by each considered approach w.r.t.
+    the iCluster disease subtypes. Make tables and plots to show the
+    results and discuss them.
+
+```{r}
+#External metrics
+
+# Convert disease subtypes to numeric vector:
+labels <- as.numeric(factor(subtypes$Subtype_Selected, levels=unique(subtypes$Subtype_Selected)));
+reference <- factor(labels, levels=sort(unique(labels)));
+types <- c("rand", "adjrand", "nmi1", "fmi", "jaccard", "vi");
+
+compute_metrics <- function(prediction) {
+  metrics_row <- mclustcomp(as.vector(prediction), labels, types=types);
+  
+  #FMI, rand_index, adj_rand_index, nmi, jaccard, purity, VI
+  c(metrics_row$scores[2],
+    metrics_row$scores[5], 
+    metrics_row$scores[1], 
+    metrics_row$scores[4],
+    metrics_row$scores[3],
+    funtimes::purity(reference, prediction)$pur,
+    metrics_row$scores[6])
+}
+
+metrics <- matrix(ncol = 7, nrow = 0)
+colnames(metrics) <- c("FMI", "rand", "adjrand", "nmi1", "jaccard", "purity", "VI")
+
+for (i in 1:length(pam_results)) {
+  prediction <- factor(pam_results[[i]]$clustering, 
+                       levels=sort(unique(pam_results[[i]]$clustering)))
+  metrics <- rbind(metrics, compute_metrics(prediction))
+}
+
+# NEMO_spectral_clustering
+counter <- length(pam_results) + 1;
+prediction <- factor(NEMO_spectral_clustering, 
+                       levels=sort(unique(NEMO_spectral_clustering)))
+metrics <- rbind(metrics, compute_metrics(prediction))
+
+# SNF_spectral_clustering
+counter <- counter + 1;
+prediction <- factor(SNF_spectral_clustering, 
+                     levels=sort(unique(SNF_spectral_clustering)))
+metrics <- rbind(metrics, compute_metrics(prediction))
+
+rownames(metrics) <- clustering_names;
+
+#use min-max normalization to adjust VI w.r.t. to the interval [0, log(n)]
+#then invert it in order to indicate that the if two clustering solutions are more similar the value is higher
+metrics[, "VI"] <- 1 - (metrics[, "VI"]) / (log(length(reference)))
+
+metrics
+
+```
+
+```{r}
+# Print results:
+# Reshape the matrix into a long format for ggplot
+long_data <- melt(metrics)
+
+# The 'Var1' column represents the type (rows) and 'Var2' represents the metric (columns)
+colnames(long_data) <- c("Type", "Metric", "Value")
+
+# Create a histogram using ggplot
+colors <- palette("default")
+plot <- ggplot(long_data, aes(x = Metric, y = Value, fill = Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_color_manual(values = colors) + # Assign a different color for each type
+  labs(x = "Metric", y = "Value", title = "External cluster validation metrics") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  theme(legend.title = element_blank())  # Remove the legend title
+
+print(plot)
+
+ggsave("larger_histogram.pdf", plot = plot, width = 12, height = 8, dpi = 300, device = "pdf")
+```
+
+```{r}
+#Internal metrics
+
+internal_metrics <- matrix(ncol = 2, nrow = 0)
+colnames(internal_metrics) <- c("Mean individual widths", "Mean Clusters widths means")
+
+for(i in 1:3) {
+  summary <- summary(silhouette(pam_results[[i]], as.dist(1-W_omics[[i]])))
+  internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+}
+
+summary <- summary(silhouette(pam_results[[4]], as.dist(1-W_AVG)))
+internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+
+summary <- summary(silhouette(pam_results[[5]], as.dist(1-W_SNF)))
+internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+
+summary <- summary(silhouette(pam_results[[6]], as.dist(1-W_NEMO)))
+internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+
+summary <- summary(silhouette(NEMO_spectral_clustering, as.dist(1-W_NEMO)))
+internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+
+summary <- summary(silhouette(SNF_spectral_clustering, as.dist(1-W_SNF)))
+internal_metrics <- rbind(internal_metrics, c(summary$avg.width, mean(summary$clus.avg.width)))
+
+rownames(internal_metrics) <- clustering_names
+
+internal_metrics
+```
+
+```{r}
+internal_metrics[,] <- sapply(internal_metrics[,], round, digits = 4) 
+metrics[,] <- sapply(metrics[,], round, digits = 4) 
+
+save_table <- function(data, columns, filename, title) {
+  df_data <- as.data.frame(data)
+  df_data <- cbind("Clustering Method" = rownames(data), df_data)
+
+  gt_table <- gt(df_data) %>%
+    tab_header(
+      title = title
+    ) %>%
+    tab_style(
+      style = cell_borders(sides = c("left", "right"), color = "lightgray", weight = px(2)),
+      locations = list(
+        cells_body(columns = everything()),  # Add borders to all columns
+        cells_column_labels(columns = everything())  # Add borders to header
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),  # Make column headers italic
+      locations = cells_column_labels(everything())
+    ) %>%
+    tab_style(
+      style = cell_text(align = "center"),  # Center the content of the second column
+      locations = cells_body(columns = 2:columns)
+    ) %>%
+    tab_options(
+      table.border.top.color = "transparent"  # Remove the horizontal line above the title
+    )
+  
+  gt_table %>%
+    gtsave(paste0(filename, ".html"))
+  
+  chrome_print(paste0(filename, ".html"), output = paste0(filename, ".pdf"))
+  unlink(paste0(filename, ".html"))
+}
+
+save_table(internal_metrics, 3, "internal_metrics_table", "Internal Cluster validation metrics")
+save_table(metrics, 8, "external_metrics_table", "External Cluster validation metrics")
+```
